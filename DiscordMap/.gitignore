@@ -8,3 +8,4 @@
 *.png
 *.log
 .DS_Store
+.Renviron.txt
