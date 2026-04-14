@@ -1,0 +1,2 @@
+APPS_SCRIPT_URL=https://script.google.com/macros/s/AKfycbx__S6Mhdn5Fu6WDQDhVKX2FtWSNUpAQqq0Q5NnXWvfY4w0iygE1yYqACPFHOlfopF8YQ/exec
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1493100444333899937/LJk0bLrEBIOFT7ZJfnRejcVywDnnxxfsaoiYp-8HgTjmCyypSlSkg0pnVIugvuoBHAcZ

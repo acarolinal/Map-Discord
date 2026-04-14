@@ -1,24 +1,45 @@
 library(shiny)
 library(leaflet)
 library(httr)
-library(googlesheets4)
+library(jsonlite)
 library(uuid)
+library(shinythemes)
 
-# --- CONFIGURATION ---
-# 1. Google Sheet URL
-options(gargle_oauth_cache = ".secrets") 
-sheet_url <- "https://docs.google.com/spreadsheets/d/1LZaRNp98FZlqjkH0sPD3u03J6ZKB2Jh0h67rKsd2eEc/edit?usp=sharing"
+# ========== CONFIGURATION ==========
+apps_script_url <- Sys.getenv("APPS_SCRIPT_URL")
+discord_webhook_url <- Sys.getenv("DISCORD_WEBHOOK_URL")
+# ========== HELPER FUNCTIONS ==========
+load_points <- function() {
+  tryCatch({
+    resp <- GET(paste0(apps_script_url, "?action=get"), timeout(10))
+    if (status_code(resp) != 200) return(data.frame())
+    text <- content(resp, "text", encoding = "UTF-8")
+    data <- fromJSON(text)
+    if (is.null(data$points)) return(data.frame())
+    df <- as.data.frame(data$points, stringsAsFactors = FALSE)
+    if (nrow(df) == 0) return(data.frame())
+    names(df) <- tolower(names(df))
+    lat_col <- grep("^lat|^latitude|^y$", names(df), value = TRUE)[1]
+    lng_col <- grep("^lng|^lon|^long|^longitude|^x$", names(df), value = TRUE)[1]
+    if (is.na(lat_col) || is.na(lng_col)) return(data.frame())
+    data.frame(name = df$name, lat = as.numeric(df[[lat_col]]), lng = as.numeric(df[[lng_col]]), stringsAsFactors = FALSE)
+  }, error = function(e) data.frame())
+}
 
-googlesheets4::gs4_deauth()
+save_point <- function(record) {
+  resp <- POST(
+    apps_script_url,
+    body = toJSON(record, auto_unbox = TRUE),
+    content_type_json(),
+    encode = "json"
+  )
+  status_code(resp) == 200
+}
 
-# 2. Discord Webhook URL (Captain Hook)
-discord_webhook_url <- "https://discord.com/api/webhooks/1493100444333899937/LJk0bLrEBIOFT7ZJfnRejcVywDnnxxfsaoiYp-8HgTjmCyypSlSkg0pnVIugvuoBHAcZ"
-
-# --- USER INTERFACE ---
+# ========== UI ==========
 ui <- fluidPage(
-  theme = shinythemes::shinytheme("flatly"),
+  theme = shinytheme("flatly"),
   titlePanel("Global Study Community Map"),
-  
   sidebarLayout(
     sidebarPanel(
       helpText("Follow these steps to join:"),
@@ -33,79 +54,112 @@ ui <- fluidPage(
       hr(),
       uiOutput("statusFeedback")
     ),
-    
     mainPanel(
       leafletOutput("mainMap", height = "700px")
     )
   )
 )
 
-# --- SERVER LOGIC ---
+# ========== SERVER ==========
 server <- function(input, output, session) {
   
-  # Reactive value to store the selected point
   selected_point <- reactiveVal(NULL)
+  existing_points <- reactiveVal(data.frame())
   
-  # Initialize the base map
+  # Function to redraw markers from existing_points()
+  update_map_markers <- function() {
+    points <- existing_points()
+    proxy <- leafletProxy("mainMap")
+    proxy %>% clearGroup("existing_points")
+    
+    if (nrow(points) > 0 && all(c("lat", "lng") %in% names(points))) {
+      proxy %>% addCircleMarkers(
+        data = points,
+        lng = ~lng, lat = ~lat,
+        radius = 6, color = "#007bff", fillOpacity = 0.7,
+        label = ~name,
+        group = "existing_points"
+      )
+    }
+  }
+  
+  # Initial load of points
+  observe({
+    points <- load_points()
+    existing_points(points)
+    update_map_markers()
+  })
+  
+  # Base map (empty, markers added later)
   output$mainMap <- renderLeaflet({
     leaflet() %>%
       addProviderTiles(providers$CartoDB.Positron) %>%
-      setView(lng = -63.17, lat = 9.75, zoom = 2) # World view centered near you
+      setView(lng = -63.17, lat = 9.75, zoom = 2)
   })
   
-  # Observe map clicks to place a temporary marker
+  # Click on map -> temporary marker
   observeEvent(input$mainMap_click, {
     click <- input$mainMap_click
     selected_point(click)
-    
     leafletProxy("mainMap") %>%
       clearGroup("temp_marker") %>%
       addMarkers(lng = click$lng, lat = click$lat, group = "temp_marker")
   })
   
-  # Action when 'Register' button is pressed
+  # Save new point
   observeEvent(input$saveData, {
-    # Validation: Ensure name and map point exist
     req(input$userName, selected_point())
     
-    # Prepare data frame for storage
-    new_record <- data.frame(
+    new_record <- list(
       id = UUIDgenerate(),
-      name = input$userName,
+      name = trimws(input$userName),
       lat = selected_point()$lat,
       lng = selected_point()$lng,
-      timestamp = Sys.time(),
-      stringsAsFactors = FALSE
+      timestamp = as.character(Sys.time())
     )
     
     tryCatch({
-      # 1. Save to Google Sheets (Now active!)
-      sheet_append(sheet_url, new_record)
+      if (!save_point(new_record)) {
+        stop("Failed to write to Google Sheets (HTTP error)")
+      }
       
-      # 2. Prepare Discord Notification
-      discord_payload <- list(
-        content = paste0("🌎 **", input$userName, "** has joined the map from (", 
-                         round(new_record$lat, 2), ", ", round(new_record$lng, 2), ")!")
+      # Discord notification
+      POST(
+        discord_webhook_url,
+        body = list(content = paste0("🌎 **", new_record$name, "** joined the map from (", 
+                                     round(new_record$lat, 2), ", ", round(new_record$lng, 2), ")!")),
+        encode = "json"
       )
       
-      # Send to Discord
-      POST(url = discord_webhook_url, body = discord_payload, encode = "json")
+      # Update local points
+      current <- existing_points()
+      new_df <- data.frame(
+        id = new_record$id,
+        name = new_record$name,
+        lat = new_record$lat,
+        lng = new_record$lng,
+        timestamp = new_record$timestamp,
+        stringsAsFactors = FALSE
+      )
+      existing_points(rbind(current, new_df))
+      update_map_markers()
       
-      # Provide visual feedback
-      output$statusFeedback <- renderUI({
-        div(class = "alert alert-success", "Location shared successfully!")
-      })
-      
-      # Clean temporary marker
+      # Clean UI
       leafletProxy("mainMap") %>% clearGroup("temp_marker")
+      selected_point(NULL)
+      updateTextInput(session, "userName", value = "")
+      
+      output$statusFeedback <- renderUI({
+        div(class = "alert alert-success", "✅ Location shared successfully!")
+      })
+      delay(5000, output$statusFeedback <- renderUI({ NULL }))
       
     }, error = function(e) {
       output$statusFeedback <- renderUI({
-        div(class = "alert alert-danger", paste("Error:", e$message))
+        div(class = "alert alert-danger", paste("❌ Error:", e$message))
       })
     })
   })
 }
 
-# Run the Application
 shinyApp(ui = ui, server = server)
